@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::io::Write;
@@ -6,6 +7,14 @@ use std::time::{Duration, Instant};
 
 type Error = Box<dyn std::error::Error>;
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Deserialize)]
+pub struct Config {
+    pub(crate) network: String,
+    pub(crate) label: String,
+    pub(crate) target: String,
+    pub(crate) dependencies: Vec<String>,
+}
 
 #[async_trait]
 pub trait Docker {
@@ -184,12 +193,11 @@ impl CurrentStack {
 pub async fn event_loop<D: Docker, W: Write>(
     mut docker: D,
     mut write: W,
-    network: String,
-    label: String,
+    config: Config,
 ) -> Result<()> {
     let tick_rate = Duration::from_secs(1);
     let mut last_tick = Instant::now();
-    let mut stack = CurrentStack::new(network, label);
+    let mut stack = CurrentStack::new(config.network, config.label);
     writeln!(
         write,
         "Looking for containers in network {} with label {}",

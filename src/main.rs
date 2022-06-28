@@ -5,13 +5,14 @@
 
 mod business;
 
-use crate::business::{event_loop, RawContainer};
+use crate::business::{event_loop, Config, RawContainer};
 use async_trait::async_trait;
 use bollard::container::ListContainersOptions;
 use bollard::models::ContainerSummary;
 use bollard::Docker;
 use business::StringVec;
 use std::collections::HashMap;
+use std::fs;
 use std::io::stdout;
 
 impl From<ContainerSummary> for RawContainer {
@@ -63,16 +64,27 @@ impl business::Docker for DockerImpl {
             .collect::<HashMap<String, RawContainer>>())
     }
 }
+
+fn config() -> business::Result<Config> {
+    let config_file = std::env::var("LOCAL_STACK_FOCUS")
+        .unwrap_or_else(|_| String::from("/local_stack_focus.toml"));
+
+    let config = fs::read_to_string(config_file)?;
+    let config = toml::from_str::<Config>(&config)?;
+    Ok(config)
+}
+
 #[tokio::main]
 async fn main() {
-    if let Err(e) = event_loop(
-        DockerImpl {},
-        stdout(),
-        "network".to_string(),
-        "local_stack_focus.fill_me_in=true".to_string(),
-    )
-    .await
-    {
+    let config = match config() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("{} error: {}", env!("CARGO_PKG_NAME"), e);
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = event_loop(DockerImpl {}, stdout(), config).await {
         eprintln!("{} error: {}", env!("CARGO_PKG_NAME"), e);
         std::process::exit(1);
     }
