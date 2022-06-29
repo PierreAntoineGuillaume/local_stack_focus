@@ -4,32 +4,37 @@
 #![allow(clippy::future_not_send)]
 
 mod business;
+use futures_util::stream::TryStreamExt;
 
-use crate::business::{event_loop, Config, RawContainer};
+use crate::business::{event_loop, Config, RawContainer, DockerError};
 use async_trait::async_trait;
-use bollard::container::ListContainersOptions;
+use bollard::container::{DownloadFromContainerOptions, ListContainersOptions};
 use bollard::models::ContainerSummary;
 use bollard::Docker;
-use business::StringVec;
 use std::collections::HashMap;
 use std::fs;
-use std::io::stdout;
+use std::io::{Read, stdout};
+use std::process::Command;
+use bollard::exec::{CreateExecOptions, StartExecOptions};
 
 impl From<ContainerSummary> for RawContainer {
     fn from(summary: ContainerSummary) -> Self {
-        let networks = summary.network_settings.map_or_else(Vec::new, |settings| {
-            settings.networks.map_or_else(Vec::new, |opts| {
-                opts.keys().cloned().collect::<Vec<String>>()
-            })
-        });
-
-        let mut labels = vec![];
-        if let Some(map) = summary.labels {
-            labels.reserve(map.len());
-            for (key, value) in map {
-                labels.push(format!("{}={}", key, value));
-            }
-        }
+        let networks: HashMap<String, String> =
+            summary
+                .network_settings
+                .map_or_else(HashMap::new, |settings| {
+                    settings.networks.map_or_else(HashMap::new, |map| {
+                        map.iter()
+                            .flat_map(|(key, val)| {
+                                if let Some(ip) = &val.ip_address {
+                                    Some((key.clone(), ip.clone()))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    })
+                });
 
         let name = summary
             .names
@@ -40,18 +45,28 @@ impl From<ContainerSummary> for RawContainer {
         Self {
             id: summary.id.expect("containers must have an id"),
             name,
-            networks: StringVec::new(networks),
-            labels: StringVec::new(labels),
+            networks,
+            labels: summary.labels.unwrap_or_default(),
         }
     }
 }
 
-struct DockerImpl {}
+struct DockerImpl {
+    wrap: Docker
+}
+
+impl DockerImpl {
+    pub fn new() -> business::Result<Self> {
+        Ok(Self {
+            wrap: Docker::connect_with_unix_defaults()?
+        })
+    }
+}
 
 #[async_trait]
 impl business::Docker for DockerImpl {
     async fn poll(&mut self) -> business::Result<HashMap<String, RawContainer>> {
-        let docker = Docker::connect_with_unix_defaults()?;
+        let docker = &self.wrap;
 
         let opts = Some(ListContainersOptions::<&str>::default());
         let list = docker.list_containers(opts).await?;
@@ -62,6 +77,33 @@ impl business::Docker for DockerImpl {
                 (raw.id.clone(), raw)
             })
             .collect::<HashMap<String, RawContainer>>())
+    }
+
+    async fn update_hosts_for(&self, container: business::Container, dependencies: &[String], network: &str, target: &str, host: &str) -> business::Result<()> {
+        let name = container.name().ok_or(DockerError::NoName(container.id()))?;
+        let opts = Some(DownloadFromContainerOptions{path: "/etc/hosts", ..Default::default()});
+        let res = self.wrap.download_from_container(&name, opts);
+
+        let bytes = res.try_fold(Vec::new(), |mut acc, chunk| async move {
+            acc.extend_from_slice(&chunk[..]);
+            Ok(acc)
+        }).await?;
+
+        let mut a: tar::Archive<&[u8]> = tar::Archive::new(&bytes[..]);
+        let mut buffer = String::new();
+        let _ = a.entries()
+            .or_else(|_| Err(DockerError::NoHost(container.id())))?
+            .nth(0).ok_or_else(|| DockerError::NoHost(container.id()))??
+            .read_to_string(&mut buffer)?
+            ;
+        let buffer = buffer.replace("\\t", "\t").replace("\\n", "\n").to_string();
+        let new_host_file = business::update_host_file(buffer, dependencies, network, target, host);
+
+        Command::new("docker")
+            .args(&["exec", "-u", "root", &container.id(), "sh", "-c", &format!(r#"echo "{}" > /etc/hosts"#, new_host_file)])
+            .output()?;
+
+        Ok(())
     }
 }
 
@@ -74,17 +116,14 @@ fn config() -> business::Result<Config> {
     Ok(config)
 }
 
+async fn wrap() -> business::Result<()> {
+    let config = config()?;
+    event_loop(DockerImpl::new()?, stdout(), config).await
+}
+
 #[tokio::main]
 async fn main() {
-    let config = match config() {
-        Ok(config) => config,
-        Err(e) => {
-            eprintln!("{} error: {}", env!("CARGO_PKG_NAME"), e);
-            std::process::exit(1);
-        }
-    };
-
-    if let Err(e) = event_loop(DockerImpl {}, stdout(), config).await {
+    if let Err(e) = wrap().await {
         eprintln!("{} error: {}", env!("CARGO_PKG_NAME"), e);
         std::process::exit(1);
     }

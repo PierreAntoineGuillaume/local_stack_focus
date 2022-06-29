@@ -8,6 +8,9 @@ edition = "2021"
 [dependencies]
 async-trait = "0.1.56"
 bollard = "0.13.0"
-tokio = { version = "1.19", features = ["macros"], default_features = false }
+flate2 = "1"
+futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
+tar = "0.4"
+tokio = { version = "1", features = ["macros"], default_features = false }
 toml = "0"
